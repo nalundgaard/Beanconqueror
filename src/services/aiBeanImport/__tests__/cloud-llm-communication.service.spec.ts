@@ -2,6 +2,7 @@ import { AI_PROVIDER_ENUM } from '../../../enums/settings/aiProvider';
 import {
   CloudLLMConfig,
   CloudLLMMessage,
+  resetModelOptionsCache,
   sendCloudLLMPrompt,
 } from '../cloud-llm-communication.service';
 
@@ -40,6 +41,9 @@ describe('cloud-llm-communication.service', () => {
 
   beforeEach(() => {
     fetchSpy = spyOn(globalThis, 'fetch');
+    // The rejected-options cache is module-level state that persists across
+    // tests; reset it so combinations remembered by one test do not leak.
+    resetModelOptionsCache();
   });
 
   // ── Request building per provider ──────────────────────────────────
@@ -415,6 +419,179 @@ describe('cloud-llm-communication.service', () => {
       await expectAsync(sendCloudLLMPrompt(config, messages)).toBeRejectedWith(
         jasmine.any(TypeError),
       );
+    });
+  });
+
+  // ── Model-options registry ─────────────────────────────────────────
+
+  describe('model-options registry', () => {
+    // WHY: Each provider+model gets a fully-formed option set (low temperature
+    // for known-old models, low reasoning effort for newer ones). Unknown
+    // models get a per-provider default. On a 400, all options are dropped and
+    // the request is retried bare, then remembered.
+
+    const success = (model: string) =>
+      mockFetchResponse({
+        choices: [{ message: { content: 'response' } }],
+        model,
+      });
+
+    const badRequest = () =>
+      mockFetchResponse({ error: { message: 'unsupported parameter' } }, 400);
+
+    it('should send a low reasoning effort for an unknown OpenAI model', async () => {
+      // Arrange
+      const config = createConfig({ model: 'gpt-5.6-terra' });
+      fetchSpy.and.returnValue(Promise.resolve(success('gpt-5.6-terra')));
+
+      // Act
+      await sendCloudLLMPrompt(config, messages);
+
+      // Assert: provider default, not temperature.
+      const body = JSON.parse(fetchSpy.calls.mostRecent().args[1].body);
+      expect(body.reasoning_effort).toBe('low');
+      expect(body.temperature).toBeUndefined();
+    });
+
+    const anthropicSuccess = (model: string) =>
+      mockFetchResponse({ content: [{ text: 'response' }], model });
+
+    const anthropicBody = async (model: string) => {
+      const config = createConfig({
+        provider: AI_PROVIDER_ENUM.ANTHROPIC,
+        model,
+      });
+      fetchSpy.and.returnValue(Promise.resolve(anthropicSuccess(model)));
+      await sendCloudLLMPrompt(config, messages);
+      return JSON.parse(fetchSpy.calls.mostRecent().args[1].body);
+    };
+
+    it('should send low effort for newest-gen Anthropic models (temperature removed)', async () => {
+      for (const model of [
+        'claude-sonnet-5',
+        'claude-opus-4-8',
+        'claude-fable-5',
+      ]) {
+        const body = await anthropicBody(model);
+        expect(body.output_config).toEqual({ effort: 'low' });
+        expect(body.temperature).toBeUndefined();
+      }
+    });
+
+    it('should send low temperature (not effort) for models that still accept it', async () => {
+      // Regression: Sonnet 4.6 / Opus 4.6 accept temperature — must not be effort-only.
+      for (const model of ['claude-sonnet-4-6', 'claude-opus-4-6']) {
+        const body = await anthropicBody(model);
+        expect(body.temperature).toBe(0.1);
+        expect(body.output_config).toBeUndefined();
+      }
+    });
+
+    it('should send temperature (never effort) for Haiku 4.5 / Sonnet 4.5, where effort errors', async () => {
+      for (const model of [
+        'claude-haiku-4-5-20251001',
+        'claude-sonnet-4-5-20250929',
+      ]) {
+        const body = await anthropicBody(model);
+        expect(body.temperature).toBe(0.1);
+        expect(body.output_config).toBeUndefined();
+        expect(body.reasoning_effort).toBeUndefined();
+      }
+    });
+
+    it('should send low effort for an unknown Anthropic model (newest-gen bet)', async () => {
+      const body = await anthropicBody('claude-opus-9');
+      expect(body.output_config).toEqual({ effort: 'low' });
+      expect(body.temperature).toBeUndefined();
+    });
+
+    it('should send the unified reasoning option for unknown OpenRouter models', async () => {
+      // Arrange
+      const config = createConfig({
+        provider: AI_PROVIDER_ENUM.OPENROUTER,
+        model: 'x-ai/grok-5',
+      });
+      fetchSpy.and.returnValue(Promise.resolve(success('x-ai/grok-5')));
+
+      // Act
+      await sendCloudLLMPrompt(config, messages);
+
+      // Assert
+      const body = JSON.parse(fetchSpy.calls.mostRecent().args[1].body);
+      expect(body.reasoning).toEqual({ effort: 'low' });
+    });
+
+    it('should send no extra options for an unknown Custom-provider model', async () => {
+      // Arrange
+      const config = createConfig({
+        provider: AI_PROVIDER_ENUM.CUSTOM,
+        model: 'my-model',
+        baseUrl: 'https://my-llm.example.com',
+      });
+      fetchSpy.and.returnValue(Promise.resolve(success('my-model')));
+
+      // Act
+      await sendCloudLLMPrompt(config, messages);
+
+      // Assert
+      const body = JSON.parse(fetchSpy.calls.mostRecent().args[1].body);
+      expect(body.temperature).toBeUndefined();
+      expect(body.reasoning_effort).toBeUndefined();
+    });
+
+    it('should drop all options and retry bare when the model rejects them with a 400', async () => {
+      // Arrange
+      const config = createConfig({ model: 'gpt-5.6-terra' });
+      fetchSpy.and.returnValues(
+        Promise.resolve(badRequest()),
+        Promise.resolve(success('gpt-5.6-terra')),
+      );
+
+      // Act
+      const result = await sendCloudLLMPrompt(config, messages);
+
+      // Assert
+      expect(result.content).toBe('response');
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+
+      const firstBody = JSON.parse(fetchSpy.calls.argsFor(0)[1].body);
+      const retryBody = JSON.parse(fetchSpy.calls.argsFor(1)[1].body);
+      expect(firstBody.reasoning_effort).toBe('low');
+      expect(retryBody.reasoning_effort).toBeUndefined();
+    });
+
+    it('should remember a rejected model and send bare on later requests', async () => {
+      // Arrange: first request rejects then succeeds, populating the cache.
+      const config = createConfig({ model: 'gpt-5.6-terra' });
+      fetchSpy.and.returnValues(
+        Promise.resolve(badRequest()),
+        Promise.resolve(success('gpt-5.6-terra')),
+      );
+      await sendCloudLLMPrompt(config, messages);
+
+      // Act: a second request to the same model.
+      fetchSpy.calls.reset();
+      fetchSpy.and.returnValue(Promise.resolve(success('gpt-5.6-terra')));
+      await sendCloudLLMPrompt(config, messages);
+
+      // Assert: bare on the first attempt, no retry needed.
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const body = JSON.parse(fetchSpy.calls.argsFor(0)[1].body);
+      expect(body.reasoning_effort).toBeUndefined();
+    });
+
+    it('should not retry when there were no options to drop (Custom provider 400)', async () => {
+      // Arrange: Custom provider sends no options, so a 400 is a real error.
+      const config = createConfig({
+        provider: AI_PROVIDER_ENUM.CUSTOM,
+        model: 'my-model',
+        baseUrl: 'https://my-llm.example.com',
+      });
+      fetchSpy.and.returnValue(Promise.resolve(badRequest()));
+
+      // Act & Assert
+      await expectAsync(sendCloudLLMPrompt(config, messages)).toBeRejected();
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
     });
   });
 });
